@@ -1,0 +1,10 @@
+pandas
+numpy
+seaborn
+# pytorch
+matplotlib
+joblib
+streamlit
+dotenv
+wordcloud
+scikit-learn

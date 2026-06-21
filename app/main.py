@@ -11,6 +11,38 @@ import pickle
 BASE_DIR = Path(__file__).resolve().parent.parent         
 MODEL_DIR = BASE_DIR / "models"
 
+@st.cache_resource
+def ensure_models_downloaded():
+    """Ensure all models are downloaded from Hugging Face Hub."""
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        st.error("Please install huggingface_hub: pip install huggingface_hub")
+        st.stop()
+        
+    REPO_ID = "monusharma21/portfolio"
+    MODELS_TO_DOWNLOAD = [
+        "logistic_model.joblib",
+        "decision_tree_model.joblib",
+        "random_forest_model.joblib",
+        "rnn_model.pt",
+        "lstm_model.pt"
+    ]
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    
+    for model_name in MODELS_TO_DOWNLOAD:
+        local_path = MODEL_DIR / model_name
+        if not local_path.exists():
+            try:
+                hf_hub_download(
+                    repo_id=REPO_ID,
+                    filename=model_name,
+                    local_dir=str(MODEL_DIR),
+                    local_dir_use_symlinks=False
+                )
+            except Exception as e:
+                st.error(f"Error downloading {model_name}: {e}")
+
 class SentimentRNN(nn.Module):
     def __init__(self, vocab_size, embedding_dim, hidden_dim, output_dim, dropout=0.5):
         super().__init__()
@@ -133,6 +165,10 @@ MODEL_REGISTRY = {
         "interpretable": "none"
     }
 }
+
+# Download models from HF if not present locally
+with st.spinner("Downloading models from Hugging Face if needed..."):
+    ensure_models_downloaded()
 
 # Load all available models
 models = {}

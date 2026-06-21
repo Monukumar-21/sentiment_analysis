@@ -31,7 +31,7 @@ movie_sentiment_analysis/
 ├── models/                  # Pre-trained models (.joblib, .pt)
 ├── notebooks/               # Jupyter notebooks for EDA and Model Training
 │   ├── 01_data_inspection_and_eda.ipynb
-│   └── models_pipeline.ipynb
+│   └── machine_learning_models.ipynb
 ├── data/                    # Raw and processed datasets
 │   ├── raw/
 │   └── processed/

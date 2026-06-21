@@ -1,65 +1,213 @@
 import streamlit as st
 import joblib
+import torch
+import torch.nn as nn
 import pandas as pd
 import numpy as np
+import re
 from pathlib import Path
+import pickle
 
-# ---------- Page config ----------
-st.set_page_config(page_title="Movie Sentiment Analyzer", page_icon="🎬")
-st.title("🎬 Movie Sentiment Analyzer")
-st.markdown("Paste a movie review and choose a model to analyze.")
-
-# ---------- Load all models (cached) ----------
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent         
 MODEL_DIR = BASE_DIR / "models"
 
+class SentimentRNN(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, output_dim, dropout=0.5):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+        self.rnn = nn.RNN(embedding_dim, hidden_dim, batch_first=True,
+                          dropout=dropout if dropout > 0 else 0)
+        self.fc = nn.Linear(hidden_dim, 32)
+        self.dropout = nn.Dropout(dropout)
+        self.out = nn.Linear(32, output_dim)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        embedded = self.embedding(x)                
+        _, hidden = self.rnn(embedded)             
+        hidden = hidden.squeeze(0)                  
+        hidden = self.dropout(hidden)
+        hidden = torch.relu(self.fc(hidden))
+        return self.sigmoid(self.out(hidden)).squeeze(1)
+
+
+class SentimentLSTM(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, output_dim, dropout=0.5):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True,
+                            dropout=dropout if dropout > 0 else 0)
+        self.fc = nn.Linear(hidden_dim, 32)
+        self.dropout = nn.Dropout(dropout)
+        self.out = nn.Linear(32, output_dim)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        embedded = self.embedding(x)
+        _, (hidden, _) = self.lstm(embedded)        
+        hidden = hidden.squeeze(0)
+        hidden = self.dropout(hidden)
+        hidden = torch.relu(self.fc(hidden))
+        return self.sigmoid(self.out(hidden)).squeeze(1)
+
+
 @st.cache_resource
-def load_model(filename):
-    file_path = MODEL_DIR / filename
-    if file_path.exists():
-        return joblib.load(file_path)
+def load_sklearn_pipeline(filename):
+    """Load a scikit-learn pipeline from a joblib file."""
+    path = MODEL_DIR / filename
+    if path.exists():
+        return joblib.load(path)
     return None
 
-available_models = {
-    "Logistic Regression": "logistic_model.joblib",
-    "Decision Tree": "decision_tree_model.joblib",
-    "Random Forest": "random_forest_model.joblib"
+@st.cache_resource
+def load_pytorch_model(filename):
+    """Load a PyTorch model checkpoint and return (model, word2idx, max_len)."""
+    path = MODEL_DIR / filename
+    if not path.exists():
+        return None, None, None
+
+    checkpoint = torch.load(path, map_location=torch.device('cpu'))
+    model_type = checkpoint['model_type']
+    vocab_size = checkpoint['vocab_size']
+    embedding_dim = checkpoint['embedding_dim']
+    hidden_dim = checkpoint['hidden_dim']
+    output_dim = checkpoint['output_dim']
+
+    if model_type == 'RNN':
+        model = SentimentRNN(vocab_size, embedding_dim, hidden_dim, output_dim)
+    else:
+        model = SentimentLSTM(vocab_size, embedding_dim, hidden_dim, output_dim)
+
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    return model, checkpoint['word2idx'], checkpoint['max_len']
+
+def predict_sklearn(pipeline, text):
+    """Return (sentiment_str, prob_neg, prob_pos) using a pipeline."""
+    proba = pipeline.predict_proba([text])[0]
+    pred = pipeline.predict([text])[0]
+    sentiment = "Positive 😊" if pred == 1 else "Negative 😞"
+    return sentiment, proba[0], proba[1]
+
+def predict_pytorch(text, model, word2idx, max_len):
+    """Return (sentiment_str, prob_pos) for a PyTorch model."""
+    # tokenize and convert
+    tokens = re.sub(r'[^a-z0-9\s]', '', text.lower()).split()
+    ids = [word2idx.get(t, 1) for t in tokens]
+    if len(ids) > max_len:
+        ids = ids[:max_len]
+    else:
+        ids += [0] * (max_len - len(ids))
+    input_tensor = torch.tensor([ids], dtype=torch.long)
+    with torch.no_grad():
+        prob_pos = model(input_tensor).item()
+    pred = 1 if prob_pos >= 0.5 else 0
+    sentiment = "Positive 😊" if pred == 1 else "Negative 😞"
+    prob_neg = 1 - prob_pos
+    return sentiment, prob_neg, prob_pos
+
+MODEL_REGISTRY = {
+    "Logistic Regression": {
+        "file": "logistic_model.joblib",
+        "loader": "sklearn",
+        "interpretable": "linear"
+    },
+    "Decision Tree": {
+        "file": "decision_tree_model.joblib",
+        "loader": "sklearn",
+        "interpretable": "tree"
+    },
+    "Random Forest": {
+        "file": "random_forest_model.joblib",
+        "loader": "sklearn",
+        "interpretable": "tree"
+    },
+    "RNN (PyTorch)": {
+        "file": "rnn_model.pt",
+        "loader": "pytorch",
+        "interpretable": "none"
+    },
+    "LSTM (PyTorch)": {
+        "file": "lstm_model.pt",
+        "loader": "pytorch",
+        "interpretable": "none"
+    }
 }
-# Load all models that exist
+
+# Load all available models
 models = {}
-for name, file in available_models.items():
-    model = load_model(file)
-    if model is not None:
-        models[name] = model
+for name, info in MODEL_REGISTRY.items():
+    if info["loader"] == "sklearn":
+        pipe = load_sklearn_pipeline(info["file"])
+        if pipe is not None:
+            models[name] = {"pipeline": pipe, "type": "sklearn", "interpretable": info["interpretable"]}
+    else:  # pytorch
+        model, w2i, maxlen = load_pytorch_model(info["file"])
+        if model is not None:
+            models[name] = {
+                "model": model,
+                "word2idx": w2i,
+                "max_len": maxlen,
+                "type": "pytorch",
+                "interpretable": info["interpretable"]
+            }
 
 if not models:
-    st.error("No model files found! Please place .joblib files in the app directory.")
+    st.error("No model files found! Please place .joblib / .pt files in the 'model/' folder.")
     st.stop()
 
-# ---------- Sidebar ----------
+# ======================== Streamlit UI ========================
+st.set_page_config(page_title="Movie Sentiment Analyzer", page_icon="🎬")
+st.title("🎬 Movie Sentiment Analyzer")
+st.markdown("Paste a movie review and choose a model to analyse.")
+
+# Sidebar
 st.sidebar.header("⚙️ Model Selection")
-model_choice = st.sidebar.selectbox("Choose a model", list(models.keys()))
+model_names = list(models.keys())
+model_choice = st.sidebar.selectbox("Choose a model", model_names)
 show_comparison = st.sidebar.checkbox("Compare all models side-by-side")
 
-# ---------- Main input area ----------
+# Input area
 user_input = st.text_area(
     "Your review:",
     height=150,
     placeholder="e.g. This film was absolutely brilliant! The acting was top-notch..."
 )
 
-# ---------- Prediction logic ----------
-def predict_one(pipeline, text):
-    """Return (sentiment, prob_neg, prob_pos) for a single pipeline."""
-    if pipeline is None:
-        return "Unknown", 0.0, 0.0
-    try:
-        proba = pipeline.predict_proba([text])[0]
-        pred = pipeline.predict([text])[0]
-        sentiment = "Positive 😊" if pred == 1 else "Negative 😞"
-        return sentiment, proba[0], proba[1]
-    except Exception as e:
-        return f"Error: {e}", 0.0, 0.0
+def show_linear_contributions(pipeline, text):
+    """For linear models (LR, SVM) show top word contributions."""
+    tfidf = pipeline.named_steps['tfidf']
+    clf = pipeline.named_steps['clf']
+    feature_names = tfidf.get_feature_names_out()
+    coef = clf.coef_[0]   # only for binary linear
+    input_vec = tfidf.transform([text])
+    non_zero = input_vec[0].indices
+
+    contributions = []
+    for idx in non_zero:
+        word = feature_names[idx]
+        impact = coef[idx] * input_vec[0, idx]
+        contributions.append((word, impact))
+    contributions.sort(key=lambda x: abs(x[1]), reverse=True)
+
+    if contributions:
+        st.write("**Word** | **Impact** (⬆️ pushes Positive)")
+        for word, impact in contributions[:15]:
+            arrow = "⬆️" if impact > 0 else "⬇️"
+            st.write(f"{word} {arrow} {impact:.4f}")
+    else:
+        st.write("No known vocabulary words found.")
+
+def show_tree_importances(pipeline):
+    """Global feature importance for tree models."""
+    tfidf = pipeline.named_steps['tfidf']
+    clf = pipeline.named_steps['clf']
+    feature_names = tfidf.get_feature_names_out()
+    importances = clf.feature_importances_
+    indices = np.argsort(importances)[::-1][:20]
+    st.write("**Top 20 global features:**")
+    for i in indices:
+        st.write(f"{feature_names[i]}: {importances[i]:.4f}")
 
 if st.button("Analyze Sentiment"):
     if user_input.strip() == "":
@@ -69,72 +217,54 @@ if st.button("Analyze Sentiment"):
 
         # ---------- Single model prediction ----------
         if not show_comparison:
-            sentiment, prob_neg, prob_pos = predict_one(models[model_choice], user_input)
+            selected = models[model_choice]
+            if selected["type"] == "sklearn":
+                sentiment, prob_neg, prob_pos = predict_sklearn(selected["pipeline"], user_input)
+            else:  # pytorch
+                sentiment, prob_neg, prob_pos = predict_pytorch(
+                    user_input, selected["model"], selected["word2idx"], selected["max_len"])
+
             st.subheader(f"Prediction ({model_choice}): {sentiment}")
 
             col1, col2 = st.columns(2)
             col1.metric("Negative", f"{prob_neg*100:.1f}%")
             col2.metric("Positive", f"{prob_pos*100:.1f}%")
-            st.progress(float(prob_pos if sentiment.startswith("Positive") else prob_neg),
-                        text="Confidence")
 
-            # ---------- Show most influential words (if logistic regression) ----------
-            if model_choice == "Logistic Regression":
-                with st.expander("Most influential words for this prediction"):
-                    pipeline = models[model_choice]
-                    tfidf = pipeline.named_steps['tfidf']
-                    clf = pipeline.named_steps['clf']
-                    feature_names = tfidf.get_feature_names_out()
-                    coeffs = clf.coef_[0]
-                    input_vec = tfidf.transform([user_input])
-                    non_zero_indices = input_vec[0].indices
+            confidence = prob_pos if "Positive" in sentiment else prob_neg
+            st.progress(float(confidence), text="Confidence")
 
-                    contributions = []
-                    for idx in non_zero_indices:
-                        word = feature_names[idx]
-                        coef = coeffs[idx]
-                        tfidf_val = input_vec[0, idx]
-                        impact = coef * tfidf_val
-                        contributions.append((word, impact))
-                    contributions.sort(key=lambda x: abs(x[1]), reverse=True)
+            # Interpretability
+            interpret = selected["interpretable"]
+            with st.expander("Model explanation"):
+                if interpret == "linear":
+                    show_linear_contributions(selected["pipeline"], user_input)
+                elif interpret == "tree":
+                    show_tree_importances(selected["pipeline"])
+                else:
+                    st.write("No built-in explanation for this model.")
 
-                    if contributions:
-                        for word, impact in contributions[:15]:
-                            direction = "⬆️ (positive)" if impact > 0 else "⬇️ (negative)"
-                            st.write(f"**{word}** {direction}: {impact:.4f}")
-                    else:
-                        st.write("No known vocabulary words found in your review.")
-
-            # ---------- Feature importance for tree models ----------
-            elif model_choice in ["Decision Tree", "Random Forest"]:
-                with st.expander("Global feature importance (for this model)"):
-                    pipeline = models[model_choice]
-                    tfidf = pipeline.named_steps['tfidf']
-                    clf = pipeline.named_steps['clf']
-                    feature_names = tfidf.get_feature_names_out()
-                    importances = clf.feature_importances_
-                    indices = np.argsort(importances)[::-1][:20]
-                    for i in indices:
-                        st.write(f"**{feature_names[i]}**: {importances[i]:.4f}")
-
-        # ---------- Side-by-side comparison ----------
         else:
             st.subheader("📊 Model Comparison")
             results = {}
-            for name, pipeline in models.items():
-                sentiment, prob_neg, prob_pos = predict_one(pipeline, user_input)
-                results[name] = {"Sentiment": sentiment, "Neg %": prob_neg*100, "Pos %": prob_pos*100}
+            for name, info in models.items():
+                if info["type"] == "sklearn":
+                    sentiment, prob_neg, prob_pos = predict_sklearn(info["pipeline"], user_input)
+                else:
+                    sentiment, prob_neg, prob_pos = predict_pytorch(
+                        user_input, info["model"], info["word2idx"], info["max_len"])
+                results[name] = {
+                    "Sentiment": sentiment,
+                    "Neg %": prob_neg * 100,
+                    "Pos %": prob_pos * 100
+                }
 
-            # Display as a table
             df_results = pd.DataFrame(results).T
             st.dataframe(df_results.style.format({
                 "Neg %": "{:.1f}%",
                 "Pos %": "{:.1f}%"
             }).background_gradient(cmap="RdYlGn", subset=["Pos %"]))
 
-            # Also show a bar chart of positive probabilities
             st.bar_chart(df_results["Pos %"])
 
-# ---------- Footer ----------
 st.markdown("---")
-st.caption("Models: Logistic Regression, Decision Tree, Random Forest (if available) · Trained on movie reviews")
+st.caption("Models: Logistic Regression, Decision Tree, Random Forest, XGBoost, CatBoost, SVM, RNN, LSTM · Trained on movie reviews")

@@ -1,5 +1,7 @@
 # 🎬 Movie Sentiment Analyzer
 
+**Live Demo:** [https://moviesentiment-analyzer.streamlit.app/](https://moviesentiment-analyzer.streamlit.app/)
+
 A machine learning web application built with Streamlit that analyzes the sentiment of movie reviews. It predicts whether a review is Positive 😊 or Negative 😞 using a variety of classic machine learning and deep learning models.
 
 ## ✨ Features
